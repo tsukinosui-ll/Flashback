@@ -26,3 +26,11 @@ app:
   cors:
     allowed-origin-patterns:
       - http://frontend.test:5173
+  upload:
+    base-dir: ./target/test-uploads
+    max-file-size: 10MB
+    allowed-extensions:
+      - jpg
+      - jpeg
+      - png
+      - gif

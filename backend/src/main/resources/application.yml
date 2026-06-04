@@ -4,6 +4,10 @@ spring:
   profiles:
     # 本地直接启动时默认使用 dev；线上仍可通过环境变量或启动参数覆盖。
     default: dev
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
 
 mybatis:
   mapper-locations: classpath:/mapper/**/*.xml
@@ -32,3 +36,11 @@ app:
       emotion: 待整理
       core-question: 暂无
       desired-outcome: 暂无
+  upload:
+    base-dir: ./uploads
+    max-file-size: 10MB
+    allowed-extensions:
+      - jpg
+      - jpeg
+      - png
+      - gif

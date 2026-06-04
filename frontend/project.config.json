@@ -23,7 +23,7 @@
     "swc": false,
     "disableSWC": true
   },
-  "miniprogramRoot": "dist/build/mp-weixin/",
+  "miniprogramRoot": "dist/dev/mp-weixin/",
   "compileType": "miniprogram",
   "simulatorPluginLibVersion": {},
   "packOptions": {

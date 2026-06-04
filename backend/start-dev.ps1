@@ -1,13 +1,15 @@
 param(
     [string]$DbUsername = "root",
     [string]$DbPassword = "123456",
+    [string]$JwtSecret = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=",
     [string]$Profile = "dev"
 )
 
 $env:DB_USERNAME = $DbUsername
 $env:DB_PASSWORD = $DbPassword
+$env:JWT_SECRET = $JwtSecret
 
 Write-Host "Starting backend with profile '$Profile' and DB user '$DbUsername'..."
-Write-Host "DB_PASSWORD has been set for this process."
+Write-Host "DB_PASSWORD and JWT_SECRET have been set for this process."
 
 mvn spring-boot:run "-Dspring-boot.run.profiles=$Profile"
