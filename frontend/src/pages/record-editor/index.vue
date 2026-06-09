@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { onLoad } from '@dcloudio/uni-app'
-import { computed, reactive, ref } from 'vue'
+import { computed, onUnmounted, reactive, ref } from 'vue'
 import { hasPreviewSession, showPreviewReadonlyToast } from '../../features/preview/preview-session'
 import ImmersiveEditorTopBar from './components/ImmersiveEditorTopBar.vue'
+import DatePickerSheet from '../../components/common/DatePickerSheet.vue'
+import { recordService } from '../../services'
 import { useRecordStore, useTagStore } from '../../stores'
 import { RecordType } from '../../types'
+import type { AudioItem } from '../../types'
 import {
   formatDateTime,
   getToken,
@@ -14,12 +17,15 @@ import {
   validateRecordContent,
 } from '../../utils'
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8080'
+
 const recordStore = useRecordStore()
 const tagStore = useTagStore()
 
 type EditorSource = 'home' | 'archive' | 'timeline'
 
 const loading = ref(false)
+const showDatePicker = ref(false)
 const recordId = ref<number | null>(null)
 const source = ref<EditorSource>('home')
 const closing = ref(false)
@@ -27,6 +33,228 @@ const initializing = ref(false)
 const initFailed = ref(false)
 const initErrorMessage = ref('')
 const latestQuery = ref<Record<string, unknown>>({})
+const recordedAudios = ref<AudioItem[]>([])
+const voiceRecording = ref(false)
+const voiceRecorderManager = ref<UniApp.RecorderManager | null>(null)
+let voiceTimer: ReturnType<typeof setInterval> | null = null
+let voiceStartTime = 0
+
+// ── Editor 富文本组件 ──
+const editorReady = ref(false)
+const editorCtx = ref<UniApp.EditorContext | null>(null)
+
+interface PastedImage {
+  id: number
+  url: string
+  relativeUrl: string
+}
+const pastedImages = ref<PastedImage[]>([])
+let nextImageId = 0
+
+const onEditorReady = () => {
+  uni.createSelectorQuery()
+    .select('#editor')
+    .context((res: any) => {
+      editorCtx.value = res.context as UniApp.EditorContext
+      editorReady.value = true
+      if (form.content) setEditorContents(form.content)
+    })
+    .exec()
+}
+
+const onEditorInput = (e: any) => {
+  form.content = e.detail.html || ''
+  syncPastedImagesFromEditor()
+}
+
+const syncPastedImagesFromEditor = () => {
+  const urlsInEditor = extractImageSrcs(form.content)
+  pastedImages.value = pastedImages.value.filter((img) =>
+    urlsInEditor.some((u) => u === img.url || u.endsWith(img.relativeUrl))
+  )
+}
+
+const setEditorContents = (html: string) => {
+  if (!editorCtx.value) return
+  const normalized = html.includes('<') ? html : `<p>${html}</p>`
+  const resolved = normalized.replace(
+    /(<img\s[^>]*src=")([^"]+)(")/g,
+    (_m: string, prefix: string, src: string, suffix: string) => {
+      if (src.startsWith('http://') || src.startsWith('https://')) return _m
+      return `${prefix}${resolveImageUrl(src)}${suffix}`
+    }
+  )
+  editorCtx.value.setContents({ html: resolved })
+
+  const imageSrcs = extractImageSrcs(resolved)
+  nextImageId = 0
+  pastedImages.value = imageSrcs.map((src) => ({
+    id: nextImageId++,
+    url: src,
+    relativeUrl: src.startsWith(API_BASE_URL) ? src.slice(API_BASE_URL.length) : src,
+  }))
+}
+
+const syncEditorContent = (): Promise<void> => {
+  return new Promise((resolve) => {
+    if (!editorCtx.value) { resolve(); return }
+    editorCtx.value.getContents({
+      success: (res: any) => { form.content = res.html; resolve() },
+      fail: () => resolve(),
+    })
+  })
+}
+
+const uploadImage = (filePath: string): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const token = getToken()
+    uni.uploadFile({
+      url: `${API_BASE_URL}/api/files/upload`,
+      filePath,
+      name: 'file',
+      header: token ? { Authorization: `Bearer ${token}` } : {},
+      success: (res) => {
+        try {
+          const data = JSON.parse(res.data)
+          if (data.code === 0) resolve(data.data)
+          else reject(new Error(data.message || '上传失败'))
+        } catch {
+          reject(new Error('上传响应解析失败'))
+        }
+      },
+      fail: (err) => reject(new Error(err.errMsg || '上传失败')),
+    })
+  })
+}
+
+const resolveImageUrl = (src: string): string => {
+  if (src.startsWith('http://') || src.startsWith('https://')) return src
+  return `${API_BASE_URL}${src.startsWith('/') ? '' : '/'}${src}`
+}
+
+const extractImageSrcs = (html: string): string[] => {
+  const urls: string[] = []
+  const regex = /<img[^>]+src="([^"]+)"/g
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(html)) !== null) {
+    if (!urls.includes(match[1])) urls.push(match[1])
+  }
+  return urls
+}
+
+const extractRelativeImageUrls = (html: string): string[] => {
+  return extractImageSrcs(html).map((url) => {
+    if (url.startsWith(API_BASE_URL)) return url.slice(API_BASE_URL.length)
+    return url
+  }).filter(Boolean)
+}
+
+const handleChooseImage = () => {
+  if (!editorCtx.value) {
+    uni.showToast({ title: '编辑器尚未就绪', icon: 'none' })
+    return
+  }
+  const editorCount = extractImageSrcs(form.content).length
+  const chipsCount = pastedImages.value.length
+  const currentCount = Math.max(editorCount, chipsCount)
+  const remaining = 9 - currentCount
+  if (remaining <= 0) {
+    uni.showToast({ title: '最多选择 9 张图片', icon: 'none' })
+    return
+  }
+  const sysInfo = uni.getSystemInfoSync()
+  const pxPerRpx = sysInfo.windowWidth / 750
+  const imgHeight = String(Math.round(28 * pxPerRpx)) + 'px'
+  uni.chooseImage({
+    count: remaining,
+    sizeType: ['compressed'],
+    sourceType: ['album'],
+    success: async (res) => {
+      uni.showLoading({ title: '上传图片中...' })
+      let hasError = false
+      let firstErrorMessage = ''
+      let successCount = 0
+      for (const filePath of res.tempFilePaths) {
+        try {
+          const url = await uploadImage(filePath)
+          const fullUrl = resolveImageUrl(url)
+          if (!editorCtx.value) throw new Error('编辑器已断开')
+          await new Promise<void>((resolve, reject) => {
+            editorCtx.value!.insertImage({
+              src: fullUrl,
+              height: imgHeight,
+              success: () => resolve(),
+              fail: () => reject(new Error('插入图片失败')),
+            })
+          })
+          pastedImages.value.push({
+            id: nextImageId++,
+            url: fullUrl,
+            relativeUrl: url,
+          })
+          successCount++
+        } catch (err: any) {
+          hasError = true
+          if (!firstErrorMessage) {
+            firstErrorMessage = err?.message || '上传失败'
+          }
+        }
+      }
+      uni.hideLoading()
+      if (hasError) {
+        if (successCount === 0) {
+          uni.showToast({ title: `图片导入失败: ${firstErrorMessage}`, icon: 'none', duration: 3000 })
+        } else {
+          uni.showToast({ title: `${successCount} 张成功，部分失败: ${firstErrorMessage}`, icon: 'none', duration: 3000 })
+        }
+      }
+    },
+    fail: (err) => {
+      if (err.errMsg && !err.errMsg.includes('cancel')) {
+        uni.showToast({ title: '选择图片失败', icon: 'none' })
+      }
+    },
+  })
+}
+
+const previewImage = (index: number) => {
+  const urls = pastedImages.value.map((img) => img.url)
+  if (urls.length === 0) return
+  uni.previewImage({
+    urls,
+    current: urls[index] || urls[0],
+  })
+}
+
+let isRemovingImage = false
+
+const removeImage = async (index: number) => {
+  if (isRemovingImage) return
+  const img = pastedImages.value[index]
+  if (!img) return
+
+  isRemovingImage = true
+  pastedImages.value.splice(index, 1)
+
+  if (editorCtx.value) {
+    let html = form.content
+    if (html) {
+      const escapedRel = img.relativeUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const escapedFull = img.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp(
+        `<img[^>]*src="(?:[^"]*${escapedRel}|[^"]*${escapedFull})"[^>]*>`,
+        'g'
+      )
+      html = html.replace(re, '').trim()
+      if (html) {
+        editorCtx.value.setContents({ html })
+      } else {
+        editorCtx.value.setContents({ html: '<p><br></p>' })
+      }
+    }
+  }
+  isRemovingImage = false
+}
 
 interface EditorSnapshot {
   title: string
@@ -53,7 +281,7 @@ const form = reactive({
   tagIds: [] as number[],
 })
 
-const wordCount = computed(() => form.content.replace(/\s/g, '').length)
+const wordCount = computed(() => form.content.replace(/<[^>]*>/g, '').replace(/\s/g, '').length)
 
 const writingDateText = computed(() => {
   const nums = ['零','一','二','三','四','五','六','七','八','九']
@@ -196,6 +424,15 @@ const fillByDetail = async (id: number) => {
   form.aiPromptResults = detail.aiPromptResults || []
   form.tagIds = detail.tags.map((tag) => Number(tag.id))
   form.unlockAtInput = detail.unlockAt ? formatDateTime(detail.unlockAt) : ''
+
+  if (detail.audios && detail.audios.length > 0) {
+    recordedAudios.value = detail.audios
+  }
+
+  // 等待编辑器就绪后填充内容
+  if (editorReady.value && form.content) {
+    setEditorContents(form.content)
+  }
 }
 
 const resolveRecordId = (value: unknown) => {
@@ -240,6 +477,7 @@ const retryInitialization = async () => {
 }
 
 const persistDraft = async () => {
+  await syncEditorContent()
   const unlockAt = toLocalDateTime(form.unlockAtInput)
   const payload = {
     title: form.title || undefined,
@@ -250,6 +488,7 @@ const persistDraft = async () => {
     aiPromptResults: form.aiPromptResults,
     tagIds: form.tagIds,
     unlockAt: unlockAt || null,
+    audios: recordedAudios.value.length > 0 ? recordedAudios.value : undefined,
   }
 
   if (recordId.value) {
@@ -324,8 +563,165 @@ const sealRecord = async () => {
 }
 
 const onAuxTap = (name: '地点' | '图片' | '语音') => {
+  if (name === '图片') {
+    handleChooseImage()
+    return
+  }
   uni.showToast({ title: `${name} 功能将在后续版本开放`, icon: 'none' })
 }
+
+const onVoiceTap = () => {
+  if (voiceRecording.value) {
+    // 正在录音，点击停止
+    stopVoiceRecording()
+  } else {
+    // 开始录音
+    startVoiceRecording()
+  }
+}
+
+const startVoiceRecording = () => {
+  if (recordedAudios.value.length >= 9) {
+    uni.showToast({ title: '最多录制9条语音', icon: 'none' })
+    return
+  }
+
+  const manager = uni.getRecorderManager()
+  voiceRecorderManager.value = manager
+  voiceRecording.value = true
+  voiceStartTime = Date.now()
+
+  manager.onStart(() => {
+    voiceTimer = setInterval(() => {
+      const elapsed = (Date.now() - voiceStartTime) / 1000
+      if (elapsed >= 60) {
+        stopVoiceRecording()
+      }
+    }, 100)
+  })
+
+  manager.onStop(async (res) => {
+    voiceRecording.value = false
+    if (voiceTimer) {
+      clearInterval(voiceTimer)
+      voiceTimer = null
+    }
+
+    const duration = res.duration ? res.duration / 1000 : (Date.now() - voiceStartTime) / 1000
+    if (duration < 0.5) return
+
+    try {
+      uni.showLoading({ title: '上传中...', mask: true })
+      const url = await recordService.uploadAudio(res.tempFilePath)
+      recordedAudios.value = [...recordedAudios.value, { url, duration }]
+    } catch (err: any) {
+      uni.showToast({ title: err?.message || '上传失败', icon: 'none' })
+    } finally {
+      uni.hideLoading()
+    }
+  })
+
+  manager.onError((err) => {
+    voiceRecording.value = false
+    if (voiceTimer) {
+      clearInterval(voiceTimer)
+      voiceTimer = null
+    }
+    uni.showToast({ title: err?.errMsg || '录音失败', icon: 'none' })
+  })
+
+  manager.start({ format: 'mp3' })
+}
+
+const stopVoiceRecording = () => {
+  if (voiceRecorderManager.value && voiceRecording.value) {
+    voiceRecorderManager.value.stop()
+  }
+}
+
+// ── 语音列表：播放与删除 ──
+const playingAudioIndex = ref<number | null>(null)
+let audioCtx: UniApp.InnerAudioContext | null = null
+
+const toggleVoicePlay = (index: number) => {
+  const audio = recordedAudios.value[index]
+  if (!audio) return
+
+  if (playingAudioIndex.value === index && audioCtx) {
+    audioCtx.stop()
+    audioCtx.destroy()
+    audioCtx = null
+    playingAudioIndex.value = null
+    return
+  }
+
+  if (audioCtx) {
+    audioCtx.stop()
+    audioCtx.destroy()
+    audioCtx = null
+  }
+
+  const resolveUrl = (url: string): string => {
+    if (url.startsWith('http://') || url.startsWith('https://')) return url
+    const base = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8080'
+    return `${base}${url.startsWith('/') ? '' : '/'}${url}`
+  }
+
+  audioCtx = uni.createInnerAudioContext()
+  audioCtx.src = resolveUrl(audio.url)
+  playingAudioIndex.value = index
+
+  audioCtx.onEnded(() => {
+    audioCtx?.destroy()
+    audioCtx = null
+    playingAudioIndex.value = null
+  })
+
+  audioCtx.onError(() => {
+    audioCtx?.destroy()
+    audioCtx = null
+    playingAudioIndex.value = null
+    uni.showToast({ title: '播放失败', icon: 'none' })
+  })
+
+  audioCtx.play()
+}
+
+const confirmRemoveAudio = (index: number) => {
+  uni.showModal({
+    title: '删除语音',
+    content: '确定要删除这条录音吗？',
+    success: (res) => {
+      if (res.confirm) {
+        if (playingAudioIndex.value === index && audioCtx) {
+          audioCtx.stop()
+          audioCtx.destroy()
+          audioCtx = null
+          playingAudioIndex.value = null
+        }
+        recordedAudios.value = recordedAudios.value.filter((_, i) => i !== index)
+      }
+    },
+  })
+}
+
+const voiceDurationText = (seconds: number): string => {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
+// 页面卸载时清理录音/播放资源
+onUnmounted(() => {
+  if (voiceTimer) clearInterval(voiceTimer)
+  if (voiceRecorderManager.value && voiceRecording.value) {
+    voiceRecorderManager.value.stop()
+  }
+  if (audioCtx) {
+    audioCtx.destroy()
+    audioCtx = null
+  }
+})
 
 onLoad(async (query) => {
   if (!ensureLogin()) {
@@ -391,26 +787,46 @@ onLoad(async (query) => {
                   placeholder="拟定一个标题..."
                   placeholder-class="title-placeholder"
                 />
-                <textarea
-                  v-model="form.content"
+
+                <!-- 图片缩略图栏 -->
+                <view v-if="pastedImages.length > 0" class="pasted-images">
+                  <view
+                    class="pasted-image-item"
+                    v-for="(img, index) in pastedImages"
+                    :key="img.id"
+                  >
+                    <image
+                      :src="img.url"
+                      mode="aspectFill"
+                      class="pasted-image-thumb"
+                      @tap="previewImage(index)"
+                    />
+                    <view class="pasted-image-del" @tap.stop="removeImage(index)">
+                      <text class="pasted-image-del-icon">x</text>
+                    </view>
+                  </view>
+                </view>
+
+                <editor
+                  id="editor"
                   class="editor-field"
-                  auto-height
-                  maxlength="5000"
+                  :show-img-size="false"
+                  :show-img-toolbar="false"
+                  :show-img-resize="false"
                   placeholder="在此刻的宁静中，留下你的记忆碎片..."
-                  placeholder-class="editor-placeholder"
+                  @ready="onEditorReady"
+                  @input="onEditorInput"
                 />
               </view>
             </view>
 
             <!-- 解封时间设置区 -->
-            <view class="unlock-bar">
+            <view class="unlock-bar" @tap="showDatePicker = true">
               <text class="unlock-label">解封时间</text>
-              <input
-                v-model="form.unlockAtInput"
-                class="unlock-input"
-                placeholder="选择未来开启的时间"
-                placeholder-class="unlock-placeholder"
-              />
+              <text class="unlock-value" :class="{ 'unlock-value--empty': !form.unlockAtInput }">
+                {{ form.unlockAtInput || '点击选择未来开启的时间' }}
+              </text>
+              <view class="unlock-arrow" />
             </view>
 
             <!-- 附件栏 MAP / IMAGE / VOICE -->
@@ -425,9 +841,18 @@ onLoad(async (query) => {
                 <text class="attach-label">图片</text>
               </view>
               <view class="attach-sep" aria-hidden="true" />
-              <view class="attach-item" @tap="onAuxTap('语音')">
-                <view class="attach-icon attach-icon--voice" aria-hidden="true" />
-                <text class="attach-label">语音</text>
+              <view
+                class="attach-item"
+                :class="{ 'attach-item--recording': voiceRecording }"
+                @tap="onVoiceTap"
+              >
+                <view
+                  class="attach-icon"
+                  :class="voiceRecording ? 'attach-icon--stop' : 'attach-icon--voice'"
+                  aria-hidden="true"
+                />
+                <text class="attach-label">{{ voiceRecording ? '停止' : '语音' }}</text>
+                <text v-if="recordedAudios.length > 0 && !voiceRecording" class="attach-badge">{{ recordedAudios.length }}</text>
               </view>
             </view>
           </view>
@@ -456,6 +881,34 @@ onLoad(async (query) => {
         </view>
       </template>
     </view>
+
+    <!-- 录制语音列表 -->
+    <view v-if="recordedAudios.length > 0" class="voice-list">
+      <view
+        v-for="(item, index) in recordedAudios"
+        :key="index"
+        class="voice-item"
+        @tap="toggleVoicePlay(index)"
+        @longpress="confirmRemoveAudio(index)"
+      >
+        <view class="voice-item__icon">
+          <view v-if="playingAudioIndex === index" class="voice-item__stop-icon" />
+          <view v-else class="voice-item__mic-icon" />
+        </view>
+        <text class="voice-item__duration">{{ voiceDurationText(item.duration) }}</text>
+        <text class="voice-item__hint">{{ playingAudioIndex === index ? '点击停止' : '点击播放' }}</text>
+        <text class="voice-item__del-hint">长按删除</text>
+      </view>
+    </view>
+
+    <!-- 解封时间滚轮选择器 -->
+    <DatePickerSheet
+      :visible="showDatePicker"
+      title="选择解封时间"
+      :initial-value="form.unlockAtInput"
+      @confirm="(v: string) => { form.unlockAtInput = v; showDatePicker = false }"
+      @cancel="showDatePicker = false"
+    />
   </view>
 </template>
 
@@ -657,6 +1110,7 @@ onLoad(async (query) => {
   gap: 24rpx;
   padding: 24rpx 40rpx;
   border-top: 1rpx solid rgba(192, 182, 165, 0.15);
+  cursor: pointer;
 }
 
 .unlock-label {
@@ -667,22 +1121,30 @@ onLoad(async (query) => {
   letter-spacing: 0.04em;
 }
 
-.unlock-input {
+.unlock-value {
   flex: 1;
-  min-height: 40rpx;
-  background: transparent;
   font-family: 'Noto Serif SC', 'Songti SC', Georgia, serif;
   font-size: 22rpx;
   color: #6b6560;
   letter-spacing: 0.03em;
+  line-height: 1.4;
 }
 
-:deep(.unlock-placeholder) {
+.unlock-value--empty {
   color: rgba(180, 170, 155, 0.7);
-  font-size: 22rpx;
 }
 
-/* 正文 textarea */
+.unlock-arrow {
+  width: 24rpx;
+  height: 24rpx;
+  flex-shrink: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' stroke='%23c8c2b8' fill='none' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='5,2 10,7 5,12'/></svg>");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+
+/* 正文 editor 富文本 */
 .editor-field {
   width: 100%;
   min-height: 400rpx;
@@ -695,10 +1157,53 @@ onLoad(async (query) => {
   letter-spacing: 0.04em;
 }
 
-:deep(.editor-placeholder) {
-  color: rgba(180, 170, 155, 0.7);
-  font-family: 'Noto Serif SC', 'Songti SC', Georgia, serif;
-  font-size: 28rpx;
+/* ── 图片缩略图栏 ── */
+.pasted-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12rpx;
+  padding: 12rpx 0;
+  border-bottom: 1rpx solid rgba(192, 182, 165, 0.15);
+  margin-bottom: 4rpx;
+}
+
+.pasted-image-item {
+  position: relative;
+  width: 56rpx;
+  height: 56rpx;
+  border-radius: 4rpx;
+  overflow: hidden;
+  border: 1rpx solid rgba(192, 182, 165, 0.25);
+  flex-shrink: 0;
+  background: #f0ebe0;
+}
+
+.pasted-image-thumb {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.pasted-image-del {
+  position: absolute;
+  top: -6rpx;
+  right: -6rpx;
+  width: 28rpx;
+  height: 28rpx;
+  border-radius: 50%;
+  background: rgba(48, 46, 41, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+
+.pasted-image-del-icon {
+  color: #fff;
+  font-size: 18rpx;
+  font-weight: 300;
+  line-height: 1;
+  font-family: 'Noto Sans SC', sans-serif;
 }
 
 /* 附件栏 */
@@ -711,6 +1216,7 @@ onLoad(async (query) => {
 }
 
 .attach-item {
+  position: relative;
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -747,10 +1253,111 @@ onLoad(async (query) => {
   letter-spacing: 0.12em;
 }
 
+.attach-badge {
+  position: absolute;
+  top: -4rpx;
+  right: 4rpx;
+  min-width: 28rpx;
+  height: 28rpx;
+  border-radius: 14rpx;
+  background: #b5352a;
+  color: #fff;
+  font-size: 18rpx;
+  font-family: 'Noto Sans SC', 'PingFang SC', sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6rpx;
+  line-height: 1;
+}
+
 .attach-sep {
   width: 1rpx;
   height: 48rpx;
   background: rgba(192, 182, 165, 0.4);
+}
+
+/* ── 录制中状态 ── */
+.attach-item--recording {
+  background: rgba(181, 53, 42, 0.06);
+  border-radius: 4rpx;
+}
+
+.attach-icon--stop {
+  width: 32rpx;
+  height: 32rpx;
+  background: #b5352a;
+  border-radius: 4rpx;
+}
+
+/* ── 语音列表（编辑器内联） ── */
+.voice-list {
+  padding: 8rpx 40rpx;
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+  border-top: 1rpx solid rgba(192, 182, 165, 0.18);
+}
+
+.voice-item {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  padding: 16rpx 20rpx;
+  background: rgba(245, 240, 232, 0.6);
+  border: 1rpx solid rgba(192, 182, 165, 0.25);
+  border-radius: 4rpx;
+}
+
+.voice-item__icon {
+  width: 44rpx;
+  height: 44rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(181, 53, 42, 0.08);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.voice-item__stop-icon {
+  width: 12rpx;
+  height: 12rpx;
+  background: #b5352a;
+  border-radius: 2rpx;
+}
+
+.voice-item__mic-icon {
+  width: 22rpx;
+  height: 22rpx;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b6560' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M12 2a3 3 0 013 3v7a3 3 0 01-6 0V5a3 3 0 013-3z'/><path d='M19 10v2a7 7 0 01-14 0v-2'/><line x1='12' y1='19' x2='12' y2='22'/><line x1='9' y1='22' x2='15' y2='22'/></svg>");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+
+.voice-item__duration {
+  font-family: 'Noto Sans SC', 'PingFang SC', sans-serif;
+  font-size: 24rpx;
+  color: #302e29;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
+.voice-item__hint {
+  flex: 1;
+  font-family: 'Noto Sans SC', 'PingFang SC', sans-serif;
+  font-size: 20rpx;
+  color: #9e9890;
+  text-align: right;
+  letter-spacing: 0.06em;
+}
+
+.voice-item__del-hint {
+  font-family: 'Noto Sans SC', 'PingFang SC', sans-serif;
+  font-size: 18rpx;
+  color: #c8c2b8;
+  letter-spacing: 0.04em;
 }
 
 /* ── 底部操作区 ── */
