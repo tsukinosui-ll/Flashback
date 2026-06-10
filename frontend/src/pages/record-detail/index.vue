@@ -6,6 +6,7 @@ import PrimaryButton from '../../components/common/PrimaryButton.vue'
 import EmptyState from '../../components/common/EmptyState.vue'
 import { useWechatNavMetrics } from '../../composables/useWechatNavMetrics'
 import { hasPreviewSession, showPreviewReadonlyToast } from '../../features/preview/preview-session'
+import AudioPlayer from '../../components/common/AudioPlayer.vue'
 import { replyService } from '../../services'
 import { useRecordStore } from '../../stores'
 import { RecordStatus, ReplyType, type ReplyVO } from '../../types'
@@ -98,6 +99,63 @@ const unlockQuote = computed(() => {
   const content = String(detail.value.content || '').trim()
   const first = content.split(/[。！？\n]/)[0]
   return first ? `"${first.slice(0, 40)}"` : ''
+})
+
+// ── 正文内联图片渲染 ──
+type ContentNode =
+  | { type: 'text'; text: string }
+  | { type: 'image'; src: string }
+
+const resolveDetailImageUrl = (url: string): string => {
+  if (url.startsWith('http://') || url.startsWith('https://')) return url
+  return `${import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8080'}${url.startsWith('/') ? '' : '/'}${url}`
+}
+
+const contentNodes = computed<ContentNode[]>(() => {
+  const html = detail.value?.content
+  if (!html) return []
+  const nodes: ContentNode[] = []
+  // 预处理：块级标签 → 换行（保留 img 标签用于正则匹配）
+  const cleaned = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+  // 逐个查找 <img> 标签，只对文字段剥离 HTML
+  const imgRe = /<img[^>]+src="([^"]+)"[^>]*>/gi
+  let lastIdx = 0
+  let m: RegExpExecArray | null
+  while ((m = imgRe.exec(cleaned)) !== null) {
+    const rawText = cleaned.slice(lastIdx, m.index)
+    const text = rawText.replace(/<[^>]+>/g, '').trim()
+    if (text) nodes.push({ type: 'text', text })
+    nodes.push({ type: 'image', src: m[1] })
+    lastIdx = imgRe.lastIndex
+  }
+  const rawTail = cleaned.slice(lastIdx)
+  const tail = rawTail.replace(/<[^>]+>/g, '').trim()
+  if (tail) nodes.push({ type: 'text', text: tail })
+  // 没有任何图片：整个内容作为纯文本
+  if (nodes.length === 0) {
+    const plain = cleaned.replace(/<[^>]+>/g, '').trim()
+    if (plain) nodes.push({ type: 'text', text: plain })
+  }
+  return nodes
+})
+
+const previewContentImage = (src: string) => {
+  const allSrcs = contentNodes.value
+    .filter((n): n is { type: 'image'; src: string } => n.type === 'image')
+    .map((n) => resolveDetailImageUrl(n.src))
+  if (allSrcs.length === 0) return
+  uni.previewImage({
+    urls: allSrcs,
+    current: resolveDetailImageUrl(src),
+  })
+}
+
+const plainContent = computed(() => {
+  if (!detail.value?.content) return ''
+  return detail.value.content.replace(/<[^>]*>/g, '')
 })
 
 const { cssVars, navBarHeight, navBarTotalHeight, rightSafeWidth, statusBarHeight } =
@@ -399,9 +457,9 @@ onLoad(async (query) => {
               <text class="sealed-quote__text">{{ unlockQuote || '"时间，是最温柔的旅人。"' }}</text>
             </view>
 
-            <!-- 模糊正文 -->
+            <!-- 模糊正文（剥离 HTML 标签） -->
             <view class="sealed-body-wrap">
-              <text class="sealed-body">{{ detail.content || '内容已封存，等待解锁后方可阅读。' }}</text>
+              <text class="sealed-body">{{ plainContent || '内容已封存，等待解锁后方可阅读。' }}</text>
               <view class="sealed-body__veil" />
             </view>
 
@@ -474,7 +532,30 @@ onLoad(async (query) => {
             <view class="unlock-card-vline" />
             <view class="unlock-card-corner" />
             <view class="unlock-card-body">
-              <text class="unlock-card-text">{{ detail.content }}</text>
+              <view class="content-flow">
+                <template v-for="(node, i) in contentNodes" :key="i">
+                  <text v-if="node.type === 'text'" class="content-flow__text">{{ node.text }}</text>
+                  <image
+                    v-else
+                    :src="resolveDetailImageUrl(node.src)"
+                    mode="heightFix"
+                    class="content-flow__image"
+                    @tap="previewContentImage(node.src)"
+                  />
+                </template>
+              </view>
+
+              <!-- 语音记录 -->
+              <view v-if="detail.audios && detail.audios.length > 0" class="content-audios">
+                <text class="content-audios__label">附 语 音</text>
+                <view class="content-audios__list">
+                  <AudioPlayer
+                    v-for="(item, i) in detail.audios"
+                    :key="i"
+                    :audio="item"
+                  />
+                </view>
+              </view>
             </view>
             <text class="unlock-sparkle">✦</text>
           </view>
@@ -1222,6 +1303,30 @@ onLoad(async (query) => {
 
 .unlock-card-body { margin-bottom: 28rpx; }
 
+/* 内容流：文字与图片内联排列 */
+.content-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.content-flow__text {
+  font-family: var(--font-reading);
+  font-size: 27rpx;
+  font-weight: 300;
+  color: var(--ink-mid);
+  line-height: 1.95;
+  letter-spacing: 0.03em;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.content-flow__image {
+  height: 28rpx;
+  width: auto;
+  vertical-align: middle;
+  border-radius: 4rpx;
+  margin: 0 4rpx;
+}
+
 .unlock-card-text {
   font-family: var(--font-reading);
   font-size: 27rpx;
@@ -1231,6 +1336,28 @@ onLoad(async (query) => {
   letter-spacing: 0.03em;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 语音记录区 */
+.content-audios {
+  margin-top: 32rpx;
+  padding-top: 24rpx;
+  border-top: 1rpx solid rgba(192, 182, 165, 0.2);
+}
+
+.content-audios__label {
+  display: block;
+  font-family: var(--font-secondary);
+  font-size: 18rpx;
+  color: var(--ink-faint);
+  letter-spacing: 0.15em;
+  margin-bottom: 16rpx;
+}
+
+.content-audios__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8rpx;
 }
 
 .unlock-sparkle {

@@ -76,7 +76,7 @@ function resolveIndices(): number[] {
       ]
     }
   }
-  // default: now + 1 day
+  
   const def = new Date(Date.now() + 86400000)
   const yi = years.indexOf(def.getFullYear())
   const mi = def.getMonth()
